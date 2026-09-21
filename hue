@@ -26,6 +26,7 @@ Exit codes:
 
 import argparse
 import difflib
+import errno
 import json
 import os
 import socket
@@ -263,8 +264,11 @@ def _ctx():
     return ctx
 
 
-def request(method, path, body=None, bridge=None, key=None, timeout=5, v2=True):
+def request(method, path, body=None, bridge=None, key=None, timeout=5, v2=True, _retry=True):
     """Make an HTTPS request to the bridge.
+
+    Retries once on transient LAN failures (EHOSTUNREACH, ECONNREFUSED, socket
+    timeout) caused by ARP expiry on Wi-Fi (en1). Sleeps 1s between attempts.
 
     Returns (status_code, parsed_json_body_or_None).
     Raises SystemExit on connection errors.
@@ -288,10 +292,22 @@ def request(method, path, body=None, bridge=None, key=None, timeout=5, v2=True):
         raw = e.read()
     except urllib.error.URLError as e:
         msg = str(e.reason)
-        if "timed out" in msg:
+        is_timeout = "timed out" in msg.lower() if isinstance(msg, str) else False
+        # Retry once for transient LAN failures (ARP expiry on Wi-Fi en1)
+        if _retry and (
+            is_timeout
+            or (isinstance(e.reason, OSError) and e.reason.errno in (errno.EHOSTUNREACH, errno.ECONNREFUSED))
+        ):
+            time.sleep(1)
+            return request(method, path, body=body, bridge=bridge, key=key, timeout=timeout, v2=v2, _retry=False)
+        if is_timeout:
             die(1, f"Bridge at {bridge} timed out after {timeout}s")
         die(1, f"Cannot reach bridge at {bridge}: {msg}")
     except OSError as e:
+        # Retry once for transient LAN failures (ARP expiry on Wi-Fi en1)
+        if _retry and e.errno in (errno.EHOSTUNREACH, errno.ECONNREFUSED, errno.ETIMEDOUT):
+            time.sleep(1)
+            return request(method, path, body=body, bridge=bridge, key=key, timeout=timeout, v2=v2, _retry=False)
         die(1, f"Cannot reach bridge at {bridge}: {e}")
 
     try:

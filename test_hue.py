@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for hue CLI. No network — fake bridge via recorded fixtures."""
 
+import errno
 import io
 import sys
 import types
@@ -465,11 +466,11 @@ class TestExitCodes(unittest.TestCase):
 
     def test_no_config_exit_4(self):
         """Running without config should exit 4."""
-        with self.assertRaises(SystemExit) as cm:
-            args = make_args("lights", bridge=None, key=None)
-            # Monkey-patch _get_snap to trigger the die
-            hue._get_snap(args)
-        self.assertEqual(cm.exception.code, 4)
+        with patch.object(hue, 'CONFIG_PATH', Path('/tmp/hue-test-nonexistent/config.json')):
+            with self.assertRaises(SystemExit) as cm:
+                args = make_args("lights", bridge=None, key=None)
+                hue._get_snap(args)
+            self.assertEqual(cm.exception.code, 4)
 
     def test_not_found_exit_3(self):
         """Unknown target should exit 3."""
@@ -492,6 +493,78 @@ class TestExitCodes(unittest.TestCase):
                         mock_time.sleep.return_value = None
                         hue.cmd_pair(args)
         self.assertEqual(cm.exception.code, 5)
+
+
+class TestRetry(unittest.TestCase):
+    """One-shot retry on transient LAN failures."""
+
+    @patch.object(hue, '_ctx')
+    @patch.object(hue.urllib.request, 'Request')
+    def test_retry_succeeds_on_second_attempt(self, mock_req, mock_ctx):
+        """First call raises OSError(65), retry succeeds."""
+        mock_ctx.return_value = None
+
+        # First call fails with EHOSTUNREACH, second succeeds
+        mock_urlopen = unittest.mock.MagicMock()
+        mock_urlopen.side_effect = [
+            OSError(errno.EHOSTUNREACH, "No route to host"),
+            unittest.mock.MagicMock(status=200, read=lambda: b'{"data": []}'),
+        ]
+
+        with patch.object(hue.urllib.request, 'urlopen', mock_urlopen):
+            with patch.object(hue, 'time') as mock_time:
+                mock_time.sleep.return_value = None
+                code, parsed = hue.request("GET", "light", bridge="192.168.1.100", key="test-key")
+
+        self.assertEqual(code, 200)
+        self.assertEqual(parsed, {"data": []})
+        # urlopen was called twice (retry)
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch.object(hue, '_ctx')
+    @patch.object(hue.urllib.request, 'Request')
+    def test_retry_exits_on_double_failure(self, mock_req, mock_ctx):
+        """Both attempts fail with OSError(65), exits 1."""
+        mock_ctx.return_value = None
+
+        mock_urlopen = unittest.mock.MagicMock()
+        mock_urlopen.side_effect = [
+            OSError(errno.EHOSTUNREACH, "No route to host"),
+            OSError(errno.EHOSTUNREACH, "No route to host"),
+        ]
+
+        with patch.object(hue.urllib.request, 'urlopen', mock_urlopen):
+            with patch.object(hue, 'time') as mock_time:
+                mock_time.sleep.return_value = None
+                with self.assertRaises(SystemExit) as cm:
+                    hue.request("GET", "light", bridge="192.168.1.100", key="test-key")
+
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch.object(hue, '_ctx')
+    @patch.object(hue.urllib.request, 'Request')
+    def test_no_retry_on_http_404(self, mock_req, mock_ctx):
+        """HTTP 4xx does not trigger a retry."""
+        mock_ctx.return_value = None
+
+        resp = unittest.mock.MagicMock(status=404)
+        resp.read.return_value = b'{"errors":[{"description":"not found"}]}'
+        # HTTPError doesn't have a useful side_effect for urlopen;
+        # we simulate it by patching urlopen to raise directly
+        mock_urlopen = unittest.mock.MagicMock()
+        http_err = hue.urllib.error.HTTPError(
+            "https://bridge/api", 404, "Not Found", {}, None
+        )
+        http_err.read = lambda: b'{}'
+        mock_urlopen.side_effect = http_err
+
+        with patch.object(hue.urllib.request, 'urlopen', mock_urlopen):
+            with self.assertRaises(SystemExit) as cm:
+                hue.request("GET", "light", bridge="192.168.1.100", key="test-key")
+
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(mock_urlopen.call_count, 1)  # no retry
 
 
 class TestOutputFormatting(unittest.TestCase):
