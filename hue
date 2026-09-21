@@ -1,0 +1,1237 @@
+#!/usr/bin/env python3
+"""
+hue — Philips Hue CLI
+
+Turn lights/rooms on/off, set brightness/colour temperature/colour, activate
+scenes, list what exists, and pair with the bridge.
+
+API: CLIP v2 (https://<bridge>/clip/v2/resource/...).
+Only pair uses v1 POST /api because that is the only way to mint a key.
+
+TLS: The bridge cert is self-signed by Signify. This tool skips verification
+(ssl._create_unverified_context). Pinning the Signify root CA is a future
+step; the threat model is a home LAN.
+
+Config: ~/.config/hue/config.json ({"bridge": "192.168.1.100", "key": "..."})
+mode 0600. Override via --bridge/--key or HUE_BRIDGE/HUE_CONFIG.
+
+Exit codes:
+  0  ok
+  1  bridge unreachable / HTTP error / timeout
+  2  usage (argparse)
+  3  target or scene not found / ambiguous
+  4  not paired (no config) or key rejected (401)
+  5  pair timed out (link button not pressed)
+"""
+
+import argparse
+import difflib
+import json
+import os
+import socket
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path.home() / ".config" / "hue"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+CONFIG_MODE = 0o600
+
+# 147 CSS named colours → (R, G, B) 0–255
+CSS_COLORS = {
+    "aliceblue": (240, 248, 255),
+    "antiquewhite": (250, 235, 215),
+    "aqua": (0, 255, 255),
+    "aquamarine": (127, 255, 212),
+    "azure": (240, 255, 255),
+    "beige": (245, 245, 220),
+    "bisque": (255, 228, 196),
+    "black": (0, 0, 0),
+    "blanchedalmond": (255, 235, 205),
+    "blue": (0, 0, 255),
+    "blueviolet": (138, 43, 226),
+    "brown": (165, 42, 42),
+    "burlywood": (222, 184, 135),
+    "cadetblue": (95, 158, 160),
+    "chartreuse": (127, 255, 0),
+    "chocolate": (210, 105, 30),
+    "coral": (255, 127, 80),
+    "cornflowerblue": (100, 149, 237),
+    "cornsilk": (255, 248, 220),
+    "crimson": (220, 20, 60),
+    "cyan": (0, 255, 255),
+    "darkblue": (0, 0, 139),
+    "darkcyan": (0, 139, 139),
+    "darkgoldenrod": (184, 134, 11),
+    "darkgray": (169, 169, 169),
+    "darkgreen": (0, 100, 0),
+    "darkgrey": (169, 169, 169),
+    "darkkhaki": (189, 183, 107),
+    "darkmagenta": (139, 0, 139),
+    "darkolivegreen": (85, 107, 47),
+    "darkorange": (255, 140, 0),
+    "darkorchid": (153, 50, 204),
+    "darkred": (139, 0, 0),
+    "darksalmon": (233, 150, 122),
+    "darkseagreen": (143, 188, 143),
+    "darkslateblue": (72, 61, 139),
+    "darkslategray": (47, 79, 79),
+    "darkslategrey": (47, 79, 79),
+    "darkturquoise": (0, 206, 209),
+    "darkviolet": (148, 0, 211),
+    "deeppink": (255, 20, 147),
+    "deepskyblue": (0, 191, 255),
+    "dimgray": (105, 105, 105),
+    "dimgrey": (105, 105, 105),
+    "dodgerblue": (30, 144, 255),
+    "firebrick": (178, 34, 34),
+    "floralwhite": (255, 250, 240),
+    "forestgreen": (34, 139, 34),
+    "fuchsia": (255, 0, 255),
+    "gainsboro": (220, 220, 220),
+    "ghostwhite": (248, 248, 255),
+    "gold": (255, 215, 0),
+    "goldenrod": (218, 165, 32),
+    "gray": (128, 128, 128),
+    "green": (0, 128, 0),
+    "greenyellow": (173, 255, 47),
+    "grey": (128, 128, 128),
+    "honeydew": (240, 255, 240),
+    "hotpink": (255, 105, 180),
+    "indianred": (205, 92, 92),
+    "indigo": (75, 0, 130),
+    "ivory": (255, 255, 240),
+    "khaki": (240, 230, 140),
+    "lavender": (230, 230, 250),
+    "lavenderblush": (255, 240, 245),
+    "lawngreen": (124, 252, 0),
+    "lemonchiffon": (255, 250, 205),
+    "lightblue": (173, 216, 230),
+    "lightcoral": (240, 128, 128),
+    "lightcyan": (224, 255, 255),
+    "lightgoldenrodyellow": (250, 250, 210),
+    "lightgray": (211, 211, 211),
+    "lightgreen": (144, 238, 144),
+    "lightgrey": (211, 211, 211),
+    "lightpink": (255, 182, 193),
+    "lightsalmon": (255, 160, 122),
+    "lightseagreen": (32, 178, 170),
+    "lightskyblue": (135, 206, 250),
+    "lightslategray": (119, 136, 153),
+    "lightslategrey": (119, 136, 153),
+    "lightsteelblue": (176, 196, 222),
+    "lightyellow": (255, 255, 224),
+    "lime": (0, 255, 0),
+    "limegreen": (50, 205, 50),
+    "linen": (250, 240, 230),
+    "magenta": (255, 0, 255),
+    "maroon": (128, 0, 0),
+    "mediumaquamarine": (102, 205, 170),
+    "mediumblue": (0, 0, 205),
+    "mediumorchid": (186, 85, 211),
+    "mediumpurple": (147, 112, 219),
+    "mediumseagreen": (60, 179, 113),
+    "mediumslateblue": (123, 104, 238),
+    "mediumspringgreen": (0, 250, 154),
+    "mediumturquoise": (72, 209, 204),
+    "mediumvioletred": (199, 21, 133),
+    "midnightblue": (25, 25, 112),
+    "mintcream": (245, 255, 250),
+    "mistyrose": (255, 228, 225),
+    "moccasin": (255, 228, 181),
+    "navajowhite": (255, 222, 173),
+    "navy": (0, 0, 128),
+    "oldlace": (253, 245, 230),
+    "olive": (128, 128, 0),
+    "olivedrab": (107, 142, 35),
+    "orange": (255, 165, 0),
+    "orangered": (255, 69, 0),
+    "orchid": (218, 112, 214),
+    "palegoldenrod": (238, 232, 170),
+    "palegreen": (152, 251, 152),
+    "paleturquoise": (175, 238, 238),
+    "palevioletred": (219, 112, 147),
+    "papayawhip": (255, 239, 213),
+    "peachpuff": (255, 218, 185),
+    "peru": (205, 133, 63),
+    "pink": (255, 192, 203),
+    "plum": (221, 160, 221),
+    "powderblue": (176, 224, 230),
+    "purple": (128, 0, 128),
+    "rebeccapurple": (102, 51, 153),
+    "red": (255, 0, 0),
+    "rosybrown": (188, 143, 143),
+    "royalblue": (65, 105, 225),
+    "saddlebrown": (139, 69, 19),
+    "salmon": (250, 128, 114),
+    "sandybrown": (244, 164, 96),
+    "seagreen": (46, 139, 87),
+    "seashell": (255, 245, 238),
+    "sienna": (160, 82, 45),
+    "silver": (192, 192, 192),
+    "skyblue": (135, 206, 235),
+    "slateblue": (106, 90, 205),
+    "slategray": (112, 128, 144),
+    "slategrey": (112, 128, 144),
+    "snow": (255, 250, 250),
+    "springgreen": (0, 255, 127),
+    "steelblue": (70, 130, 180),
+    "tan": (210, 180, 140),
+    "teal": (0, 128, 128),
+    "thistle": (216, 191, 216),
+    "tomato": (255, 99, 71),
+    "turquoise": (64, 224, 208),
+    "violet": (238, 130, 238),
+    "wheat": (245, 222, 179),
+    "white": (255, 255, 255),
+    "whitesmoke": (245, 245, 245),
+    "yellow": (255, 255, 0),
+    "yellowgreen": (154, 205, 50),
+}
+
+# sRGB → CIE XYZ matrix (standard IEC 61966-2-1)
+SRGB_TO_XYZ = (
+    (0.4124564, 0.3575761, 0.1804375),
+    (0.2126729, 0.7151522, 0.0721750),
+    (0.0193339, 0.1191920, 0.9503041),
+)
+
+V2_TYPES = ("light", "room", "zone", "grouped_light", "scene", "device")
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def load_config(bridge=None, key=None):
+    """Load config from file or env, with CLI overrides."""
+    cfg = {"bridge": None, "key": None}
+
+    # Env overrides
+    env_bridge = os.environ.get("HUE_BRIDGE")
+    env_config = os.environ.get("HUE_CONFIG")
+
+    config_file = env_config or CONFIG_PATH
+    if config_file and Path(config_file).exists():
+        try:
+            data = json.loads(Path(config_file).read_text())
+            cfg.update(data)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if env_bridge:
+        cfg["bridge"] = env_bridge
+
+    # CLI overrides
+    if bridge:
+        cfg["bridge"] = bridge
+    if key:
+        cfg["key"] = key
+
+    return cfg
+
+
+def save_config(bridge, key):
+    """Write config file with mode 0600."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = json.dumps({"bridge": bridge, "key": key}, indent=2)
+    path = str(CONFIG_PATH)
+    urandom = "/dev/urandom" if sys.platform != "win32" else None
+
+    # Write to temp then rename for atomicity
+    tmp = Path(str(CONFIG_PATH) + ".tmp")
+    tmp.write_text(data)
+    tmp.chmod(CONFIG_MODE)
+    tmp.rename(CONFIG_PATH)
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def _ctx():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def request(method, path, body=None, bridge=None, key=None, timeout=5, v2=True):
+    """Make an HTTPS request to the bridge.
+
+    Returns (status_code, parsed_json_body_or_None).
+    Raises SystemExit on connection errors.
+    """
+    url = f"https://{bridge}/clip/v2/resource/{path}" if v2 else f"https://{bridge}/api"
+    headers = {"Content-Type": "application/json"}
+    if v2 and key:
+        headers["hue-application-key"] = key
+
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        resp = urllib.request.urlopen(req, context=_ctx(), timeout=timeout)
+        raw = resp.read()
+        code = resp.status
+    except urllib.error.HTTPError as e:
+        code = e.code
+        raw = e.read()
+    except urllib.error.URLError as e:
+        msg = str(e.reason)
+        if "timed out" in msg:
+            die(1, f"Bridge at {bridge} timed out after {timeout}s")
+        die(1, f"Cannot reach bridge at {bridge}: {msg}")
+    except OSError as e:
+        die(1, f"Cannot reach bridge at {bridge}: {e}")
+
+    try:
+        parsed = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        parsed = None
+
+    # Translate v2 errors in response body
+    if parsed and isinstance(parsed, dict) and parsed.get("errors"):
+        errs = parsed["errors"]
+        for e in errs:
+            desc = e.get("description", str(e))
+            if code == 401:
+                die(4, f"Key rejected by bridge. Run 'hue pair' to get a new key: {desc}")
+            die(1, f"Bridge error: {desc}")
+
+    if code == 401:
+        die(4, "Key rejected by bridge. Run 'hue pair' to get a new key.")
+
+    if code >= 400:
+        die(1, f"HTTP {code} from bridge: {raw[:200].decode(errors='replace')}")
+
+    return code, parsed
+
+
+# ---------------------------------------------------------------------------
+# Colour conversion
+# ---------------------------------------------------------------------------
+
+def kelvin_to_mirek(k):
+    """Convert Kelvin to mirek (microreciprocal), truncating as the bridge does."""
+    k = max(2000, min(6500, k))
+    return int(1_000_000 / k)
+
+
+def mirek_to_kelvin(m):
+    """Convert mirek to Kelvin."""
+    return int(round(1_000_000 / m))
+
+
+def css_color_to_rgb(name):
+    """Look up a CSS colour name → (R, G, B) 0–255 or None."""
+    return CSS_COLORS.get(name.lower().replace(" ", ""))
+
+
+def hex_to_rgb(hex_str):
+    """Parse #rrggbb or rrggbb → (R, G, B) 0–255 or None."""
+    h = hex_str.lstrip("#")
+    if len(h) != 6:
+        return None
+    try:
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except ValueError:
+        return None
+
+
+def rgb_to_xy(r, g, b):
+    """Convert sRGB (0–255) to CIE 1931 xy (x, y) with Y ≈ brightness.
+
+    Returns (x, y) floats in 0–1 range.
+    """
+    # Normalise and linearise (gamma correction)
+    rl = _linearize(r / 255.0)
+    gl = _linearize(g / 255.0)
+    bl = _linearize(b / 255.0)
+
+    # sRGB → XYZ
+    x = rl * SRGB_TO_XYZ[0][0] + gl * SRGB_TO_XYZ[0][1] + bl * SRGB_TO_XYZ[0][2]
+    y = rl * SRGB_TO_XYZ[1][0] + gl * SRGB_TO_XYZ[1][1] + bl * SRGB_TO_XYZ[1][2]
+    z = rl * SRGB_TO_XYZ[2][0] + gl * SRGB_TO_XYZ[2][1] + bl * SRGB_TO_XYZ[2][2]
+
+    total = x + y + z
+    if total == 0:
+        return (0.0, 0.0)
+
+    return (round(x / total, 6), round(y / total, 6))
+
+
+def _linearize(c):
+    """sRGB gamma correction: linearise a single channel."""
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
+
+
+def parse_color(color_str):
+    """Parse a CSS name or #rrggbb → CIE xy tuple or None."""
+    if color_str.startswith("#") or (len(color_str) == 6 and all(c in "0123456789abcdefABCDEF" for c in color_str)):
+        rgb = hex_to_rgb(color_str)
+    else:
+        rgb = css_color_to_rgb(color_str)
+    if rgb is None:
+        return None
+    return rgb_to_xy(*rgb)
+
+
+def format_bri(b):
+    """Format brightness value from bridge (0–100 float) as % string."""
+    if b is None:
+        return "-"
+    return f"{round(b)}%"
+
+
+def format_ct(mirek):
+    """Format mirek as Kelvin string."""
+    if mirek is None:
+        return "-"
+    return f"{mirek_to_kelvin(mirek)}K"
+
+
+# ---------------------------------------------------------------------------
+# Snapshot: fetch all resources and join them
+# ---------------------------------------------------------------------------
+
+def snapshot(bridge, key, timeout):
+    """Fetch all v2 resources and return a joined lookup dict.
+
+    Returns {
+        "lights": [...],       # raw resources
+        "rooms": [...],
+        "zones": [...],
+        "grouped_lights": [...],
+        "scenes": [...],
+        "devices": [...],
+        # Derived maps
+        "rid_index": {rid: resource},              # all resources keyed by id
+        "gl_by_owner": {owner_id: grouped_light},  # grouped_light → its parent (room/zone)
+        "light_device": {light_id: device_id},
+        "device_by_id": {device_id: device},
+    }
+    """
+    data = {}
+    for rtype in V2_TYPES:
+        _, resp = request("GET", rtype, bridge=bridge, key=key, timeout=timeout)
+        data[rtype] = resp.get("data", []) if resp else []
+
+    # Build rid_index
+    rid_index = {}
+    for rtype in V2_TYPES:
+        for r in data[rtype]:
+            rid_index[r["id"]] = r
+
+    # Grouped lights → owner mapping (owner = room/zone that has this gl in services)
+    gl_by_owner = {}
+    for room in data["room"]:
+        for svc in room.get("services", []):
+            if svc["rtype"] == "grouped_light":
+                gl_by_owner[room["id"]] = rid_index.get(svc["rid"])
+    for zone in data["zone"]:
+        for svc in zone.get("services", []):
+            if svc["rtype"] == "grouped_light":
+                gl_by_owner[zone["id"]] = rid_index.get(svc["rid"])
+
+    # Light → device mapping (device has services with rtype=light)
+    light_device = {}
+    device_by_id = {}
+    for dev in data["device"]:
+        device_by_id[dev["id"]] = dev
+        for svc in dev.get("services", []):
+            if svc["rtype"] == "light":
+                light_device[svc["rid"]] = dev["id"]
+
+    return {
+        "lights": data["light"],
+        "rooms": data["room"],
+        "zones": data["zone"],
+        "grouped_lights": data["grouped_light"],
+        "scenes": data["scene"],
+        "devices": data["device"],
+        "rid_index": rid_index,
+        "gl_by_owner": gl_by_owner,
+        "light_device": light_device,
+        "device_by_id": device_by_id,
+    }
+
+
+def get_light_brightness(light):
+    """Extract brightness percent from a light resource (0–100 int)."""
+    d = light.get("dimming", {})
+    return d.get("brightness")
+
+
+def get_light_on(light):
+    """Extract on/off state from a light resource."""
+    o = light.get("on", {})
+    return o.get("on")
+
+
+def get_light_color_temp(light):
+    """Extract mirek from a light resource."""
+    ct = light.get("color_temperature", {})
+    return ct.get("mirek")
+
+
+def get_light_color(light):
+    """Extract CIE xy from a light resource."""
+    c = light.get("color", {})
+    xy = c.get("xy")
+    if xy:
+        return (xy.get("x"), xy.get("y"))
+    return None
+
+
+def get_gl_on(gl):
+    """Get the any_on/all_on state from a grouped_light.
+
+    any_on is optional in the v2 API; falls back to on.on.
+    """
+    if gl is None:
+        return None, None
+    on = gl.get("on", {}).get("on")
+    any_on = gl.get("on", {}).get("any_on", on)
+    return on, any_on
+
+
+# ---------------------------------------------------------------------------
+# Resolver
+# ---------------------------------------------------------------------------
+
+def resolve_name(name, snap, room_filter=None, scene_only=False):
+    """Resolve a name to one or more targets.
+
+    Case-insensitive. Checks rooms first, then lights, then zones.
+    Returns list of {"type", "id", "name", "grouped_light_id"}.
+    Empty list if not found.
+    """
+    if scene_only:
+        return _resolve_scene_name(name, snap, room_filter)
+
+    nl = name.lower()
+    results = []
+
+    # Rooms
+    for r in snap["rooms"]:
+        if r.get("metadata", {}).get("name", "").lower() == nl:
+            gl = snap["gl_by_owner"].get(r["id"])
+            results.append({
+                "type": "room",
+                "id": r["id"],
+                "name": r.get("metadata", {}).get("name", ""),
+                "grouped_light_id": gl["id"] if gl else None,
+            })
+
+    # Lights
+    for l in snap["lights"]:
+        dev_id = snap["light_device"].get(l["id"])
+        dev = snap["device_by_id"].get(dev_id) if dev_id else None
+        lname = l.get("metadata", {}).get("name", "")
+        if not lname and dev:
+            lname = dev.get("product_name", "")
+        if lname.lower() == nl:
+            results.append({
+                "type": "light",
+                "id": l["id"],
+                "name": lname,
+                "grouped_light_id": None,
+            })
+
+    # Zones
+    for z in snap["zones"]:
+        if z.get("metadata", {}).get("name", "").lower() == nl:
+            gl = snap["gl_by_owner"].get(z["id"])
+            results.append({
+                "type": "zone",
+                "id": z["id"],
+                "name": z.get("metadata", {}).get("name", ""),
+                "grouped_light_id": gl["id"] if gl else None,
+            })
+
+    return results
+
+
+def _resolve_scene_name(name, snap, room_filter=None):
+    """Resolve a scene name within room scope."""
+    nl = name.lower()
+    results = []
+
+    for s in snap["scenes"]:
+        sname = s.get("metadata", {}).get("name", "")
+        if sname.lower() != nl:
+            continue
+        group = s.get("group", {})
+        room_id = group.get("rid")
+        if room_filter and room_id != room_filter:
+            continue
+        if room_filter is None:
+            # Check uniqueness
+            pass
+        results.append({
+            "type": "scene",
+            "id": s["id"],
+            "name": sname,
+            "room_id": room_id,
+            "room_name": snap["rid_index"].get(room_id, {}).get("metadata", {}).get("name", "") if room_id else "",
+        })
+
+    return results
+
+
+def resolve_targets(target_strs, snap):
+    """Resolve one or more target strings → list of target dicts.
+
+    Handles 'all' and UUIDs directly.
+    """
+    targets = []
+    for t in target_strs:
+        if t == "all":
+            for r in snap["rooms"]:
+                gl = snap["gl_by_owner"].get(r["id"])
+                targets.append({
+                    "type": "room",
+                    "id": r["id"],
+                    "name": r.get("metadata", {}).get("name", ""),
+                    "grouped_light_id": gl["id"] if gl else None,
+                })
+            continue
+
+        # Try as UUID (any id in rid_index)
+        r = snap["rid_index"].get(t)
+        if r:
+            rtype = r.get("type", "")
+            if rtype == "room":
+                gl = snap["gl_by_owner"].get(t)
+                targets.append({"type": "room", "id": t, "name": r.get("metadata", {}).get("name", t), "grouped_light_id": gl["id"] if gl else None})
+            elif rtype == "zone":
+                gl = snap["gl_by_owner"].get(t)
+                targets.append({"type": "zone", "id": t, "name": r.get("metadata", {}).get("name", t), "grouped_light_id": gl["id"] if gl else None})
+            elif rtype == "light":
+                targets.append({"type": "light", "id": t, "name": r.get("metadata", {}).get("name", t), "grouped_light_id": None})
+            elif rtype == "grouped_light":
+                for oid, gl in snap["gl_by_owner"].items():
+                    if gl and gl["id"] == t:
+                        owner = snap["rid_index"].get(oid)
+                        targets.append({"type": owner.get("type", "room") if owner else "room", "id": oid, "name": owner.get("metadata", {}).get("name", t) if owner else t, "grouped_light_id": t})
+                        break
+            else:
+                targets.append({"type": rtype, "id": t, "name": r.get("metadata", {}).get("name", t), "grouped_light_id": None})
+            continue
+
+        # Name resolution
+        results = resolve_name(t, snap)
+        if results:
+            targets.extend(results)
+        else:
+            # Try close matches
+            all_names = []
+            for r in snap["rooms"]:
+                all_names.append(r.get("metadata", {}).get("name", ""))
+            for l in snap["lights"]:
+                lname = l.get("metadata", {}).get("name", "")
+                if not lname:
+                    dev_id = snap["light_device"].get(l["id"])
+                    dev = snap["device_by_id"].get(dev_id) if dev_id else None
+                    if dev:
+                        lname = dev.get("product_name", "")
+                all_names.append(lname)
+            for z in snap["zones"]:
+                all_names.append(z.get("metadata", {}).get("name", ""))
+
+            matches = difflib.get_close_matches(t, [n for n in all_names if n], n=5, cutoff=0.5)
+            if matches:
+                did_you = f" Did you mean: {', '.join(matches)}?"
+            else:
+                did_you = ""
+            die(3, f'No target named "{t}".{did_you}')
+
+    return targets
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def trim_resource(r, snap):
+    """Trim a resource to the standard --json fields."""
+    tid = r["id"]
+    obj = {"id": tid, "name": r.get("metadata", {}).get("name", ""), "type": r.get("type", "")}
+
+    if r.get("type") in ("light",):
+        obj["on"] = get_light_on(r)
+        obj["brightness"] = get_light_brightness(r)
+        ct = get_light_color_temp(r)
+        obj["color_temperature"] = mirek_to_kelvin(ct) if ct else None
+        xy = get_light_color(r)
+        obj["color"] = {"x": xy[0], "y": xy[1]} if xy else None
+        # Find room
+        obj["room"] = None
+        for room in snap["rooms"]:
+            for svc in room.get("services", []):
+                if svc["rtype"] == "light" and svc["rid"] == tid:
+                    obj["room"] = room.get("metadata", {}).get("name", "")
+                    break
+
+    elif r.get("type") in ("room", "zone"):
+        gl = snap["gl_by_owner"].get(tid)
+        if gl:
+            _, any_on = get_gl_on(gl)
+            obj["on"] = any_on
+            obj["brightness"] = get_light_brightness(gl) if gl.get("dimming") else None
+        obj["light_count"] = len([s for s in r.get("services", []) if s["rtype"] == "light"])
+
+    elif r.get("type") in ("grouped_light",):
+        on_state, any_on = get_gl_on(r)
+        obj["on"] = on_state if on_state is not None else any_on
+        obj["brightness"] = get_light_brightness(r)
+
+    return obj
+
+
+def fmt_table(rows, headers):
+    """Print a left-aligned table of rows (list of lists)."""
+    if not rows:
+        return
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    print(fmt.format(*("-" * w for w in widths)))
+    for row in rows:
+        print(fmt.format(*row))
+
+
+def json_out(items, quiet=False):
+    """Print items as JSON array."""
+    if quiet:
+        return
+    print(json.dumps(items, indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def die(code, msg):
+    """Print msg to stderr and exit with code."""
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def cmd_pair(args):
+    """Pair with the bridge: poll v1 POST /api until link button pressed."""
+    bridge = args.bridge
+    if not bridge:
+        # Try discovery.meethue.com
+        try:
+            _, disc_resp = request("GET", "", bridge="discovery.meethue.com", key=None, timeout=args.timeout, v2=False)
+            if disc_resp and isinstance(disc_resp, list) and len(disc_resp) > 0:
+                bridge = disc_resp[0].get("internalipaddress")
+                if not bridge:
+                    bridge = disc_resp[0].get("ipaddress")
+        except SystemExit:
+            pass
+        if not bridge:
+            die(1, "No bridge found via discovery.meethue.com. Specify --bridge <IP>")
+
+    hostname = socket.gethostname()
+    devicetype = f"hue-cli@{hostname}"
+
+    print(f"Press the link button on the bridge at {bridge}, then press Enter...", file=sys.stderr)
+    input()
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        _, resp = request("POST", "", body={"devicetype": devicetype}, bridge=bridge, key=None, timeout=args.timeout, v2=False)
+        if resp and isinstance(resp, list) and len(resp) > 0:
+            entry = resp[0]
+            if "success" in entry:
+                key = entry["success"].get("username")
+                if key:
+                    save_config(bridge, key)
+                    print(f"Paired with {bridge}. Key saved to {CONFIG_PATH}", file=sys.stderr)
+                    return
+            elif "error" in entry:
+                err_desc = entry["error"].get("description", "")
+                if "link button" in err_desc.lower():
+                    print("  Link button not pressed yet...", file=sys.stderr)
+                    time.sleep(2)
+                else:
+                    die(1, f"Pair error: {err_desc}")
+        else:
+            time.sleep(2)
+
+    die(5, "Pair timed out after 90s. Press the link button and try again.")
+
+
+def cmd_lights(args):
+    """List all lights."""
+    snap = _get_snap(args)
+    rows = []
+    json_rows = []
+    for l in snap["lights"]:
+        name = l.get("metadata", {}).get("name", "")
+        if not name:
+            dev_id = snap["light_device"].get(l["id"])
+            dev = snap["device_by_id"].get(dev_id) if dev_id else None
+            name = dev.get("product_name", "") if dev else ""
+        on = get_light_on(l)
+        bri = get_light_brightness(l)
+        reachable = l.get("light", {}).get("is_reachable", l.get("reachable", True))
+        # Find room
+        room_name = ""
+        for room in snap["rooms"]:
+            for svc in room.get("services", []):
+                if svc["rtype"] == "light" and svc["rid"] == l["id"]:
+                    room_name = room.get("metadata", {}).get("name", "")
+                    break
+
+        on_str = "on" if on else "off"
+        bri_str = format_bri(bri)
+        reach_str = "yes" if reachable else "no"
+
+        if args.json:
+            json_rows.append({
+                **trim_resource({"id": l["id"], **l}, snap),
+                "reachable": reachable,
+            })
+        else:
+            rows.append([name, on_str, bri_str, reach_str, room_name])
+
+    if args.json:
+        json_out(json_rows, args.quiet)
+    else:
+        fmt_table(rows, ["Name", "State", "Brightness", "Reachable", "Room"])
+
+
+def cmd_rooms(args):
+    """List all rooms."""
+    snap = _get_snap(args)
+    rows = []
+    json_rows = []
+    for r in snap["rooms"]:
+        name = r.get("metadata", {}).get("name", "")
+        gl = snap["gl_by_owner"].get(r["id"])
+        light_count = len([s for s in r.get("services", []) if s["rtype"] == "light"])
+        if gl:
+            any_on = get_gl_on(gl)[1]
+            state = "on" if any_on else "off"
+        else:
+            state = "-"
+
+        if args.json:
+            json_rows.append(trim_resource({"id": r["id"], **r}, snap))
+        else:
+            rows.append([name, str(light_count), state])
+
+    if args.json:
+        json_out(json_rows, args.quiet)
+    else:
+        fmt_table(rows, ["Name", "Lights", "State"])
+
+
+def cmd_scenes(args):
+    """List all scenes, optionally filtered by room."""
+    snap = _get_snap(args)
+    room_filter = args.room.lower() if args.room else None
+
+    # Group scenes by room
+    scenes_by_room = {}
+    for s in snap["scenes"]:
+        group = s.get("group", {})
+        room_id = group.get("rid")
+        room = snap["rid_index"].get(room_id) if room_id else None
+        room_name = room.get("metadata", {}).get("name", "Unknown") if room else "Unknown"
+
+        if room_filter and room_name.lower() != room_filter:
+            continue
+
+        sname = s.get("metadata", {}).get("name", "")
+        scenes_by_room.setdefault(room_name, []).append(sname)
+
+    if args.json:
+        items = []
+        for room_name, scene_names in sorted(scenes_by_room.items()):
+            items.append({"room": room_name, "scenes": sorted(scene_names)})
+        json_out(items, args.quiet)
+    else:
+        for room_name in sorted(scenes_by_room.keys()):
+            print(f"\n{room_name}:")
+            for sn in sorted(scenes_by_room[room_name]):
+                print(f"  {sn}")
+        if not scenes_by_room:
+            print("No scenes found.")
+
+
+def cmd_status(args):
+    """Show detail for one target, or everything."""
+    snap = _get_snap(args)
+
+    if args.target:
+        targets = resolve_targets(args.target, snap)
+        json_rows = []
+        rows = []
+        for t in targets:
+            r = snap["rid_index"].get(t["id"])
+            if not r:
+                continue
+            if args.json:
+                json_rows.append(trim_resource({"id": t["id"], **r}, snap))
+            else:
+                _print_status_line(t, r, snap)
+        if args.json:
+            json_out(json_rows, args.quiet)
+    else:
+        # Show everything
+        if args.json:
+            items = []
+            for r in snap["rooms"]:
+                items.append(trim_resource({"id": r["id"], **r}, snap))
+            for l in snap["lights"]:
+                items.append(trim_resource({"id": l["id"], **l}, snap))
+            for z in snap["zones"]:
+                items.append(trim_resource({"id": z["id"], **z}, snap))
+            json_out(items, args.quiet)
+        else:
+            if snap["rooms"]:
+                print("Rooms:")
+                for r in snap["rooms"]:
+                    t = {"type": "room", "id": r["id"], "name": r.get("metadata", {}).get("name", ""),
+                         "grouped_light_id": snap["gl_by_owner"].get(r["id"], {}).get("id") if snap["gl_by_owner"].get(r["id"]) else None}
+                    _print_status_line(t, r, snap)
+            if snap["lights"]:
+                print("\nLights:")
+                for l in snap["lights"]:
+                    t = {"type": "light", "id": l["id"], "name": l.get("metadata", {}).get("name", ""), "grouped_light_id": None}
+                    _print_status_line(t, l, snap)
+
+
+def _print_status_line(target, resource, snap):
+    """Print one status line for a target."""
+    name = target.get("name") or resource.get("metadata", {}).get("name", "?")
+    rtype = target.get("type") or resource.get("type", "?")
+
+    if rtype == "room" or rtype == "zone":
+        gl = snap["gl_by_owner"].get(target["id"])
+        if gl:
+            on_state, any_on = get_gl_on(gl)
+            state = "on" if any_on else "off"
+            bri = get_light_brightness(gl)
+            line = f"  {name} ({rtype}): {state}"
+            if bri is not None:
+                line += f", {format_bri(bri)}"
+            print(line)
+        else:
+            print(f"  {name} ({rtype}): no grouped_light")
+    elif rtype == "light":
+        on_state = get_light_on(resource)
+        bri = get_light_brightness(resource)
+        ct = get_light_color_temp(resource)
+        xy = get_light_color(resource)
+        reachable = resource.get("light", {}).get("is_reachable", True)
+        state = "on" if on_state else "off"
+        line = f"  {name} (light): {state}"
+        if bri is not None:
+            line += f", {format_bri(bri)}"
+        if ct is not None:
+            line += f", {format_ct(ct)}"
+        if xy and xy != (0.0, 0.0):
+            line += f", xy=({xy[0]}, {xy[1]})"
+        if not reachable:
+            line += " [unreachable]"
+        print(line)
+
+
+def cmd_on(args):
+    """Turn target(s) on."""
+    snap = _get_snap(args)
+    targets = resolve_targets(args.target, snap)
+    _do_mutation_with_targets([(t, True) for t in targets], None, args, snap=snap)
+
+
+def cmd_off(args):
+    """Turn target(s) off."""
+    snap = _get_snap(args)
+    targets = resolve_targets(args.target, snap)
+    _do_mutation_with_targets([(t, False) for t in targets], None, args, snap=snap)
+
+
+def cmd_toggle(args):
+    """Toggle target(s)."""
+    snap = _get_snap(args)
+    targets = resolve_targets(args.target, snap)
+    toggle_list = []
+    for t in targets:
+        r = snap["rid_index"].get(t["id"])
+        if t["grouped_light_id"]:
+            gl_id = t["grouped_light_id"]
+            gl = snap["rid_index"].get(gl_id)
+            _, any_on = get_gl_on(gl)
+            toggle_list.append((t, not any_on if any_on is not None else True))
+        else:
+            on_state = get_light_on(r)
+            toggle_list.append((t, not on_state if on_state is not None else True))
+    _do_mutation_with_targets(toggle_list, None, args, snap=snap)
+
+
+def cmd_set(args):
+    """Set properties on target(s)."""
+    snap = _get_snap(args)
+    targets = resolve_targets(args.target, snap)
+    _do_mutation_with_targets([(t, None) for t in targets], args, args, snap=snap)
+
+
+def _do_mutation_with_targets(targets_with_state, set_args, args, snap=None):
+    """Apply mutation to resolved targets.
+
+    targets_with_state: list of (target_dict, override_on_state_or_None)
+    """
+    if snap is None:
+        snap = _get_snap(args)
+    results = []
+
+    for target, override_on in targets_with_state:
+        body = {}
+
+        if override_on is not None:
+            body["on"] = {"on": override_on}
+        elif set_args:
+            if getattr(set_args, 'set_on', None):
+                body["on"] = {"on": True}
+            elif getattr(set_args, 'set_off', None):
+                body["on"] = {"on": False}
+
+        if set_args and set_args.brightness is not None:
+            bri = max(0, min(100, set_args.brightness))
+            body.setdefault("dimming", {})
+            body["dimming"]["brightness"] = bri
+
+        if set_args and set_args.color_temp is not None:
+            mirek = kelvin_to_mirek(set_args.color_temp)
+            body.setdefault("color_temperature", {})
+            body["color_temperature"]["mirek"] = mirek
+
+        if set_args and set_args.color is not None:
+            xy = parse_color(set_args.color)
+            if xy is None:
+                die(3, f'Unknown colour "{set_args.color}". Use a CSS name or #rrggbb.')
+            body.setdefault("color", {})
+            body["color"]["xy"] = {"x": xy[0], "y": xy[1]}
+
+        if set_args and set_args.transition is not None:
+            body["dynamics"] = {"duration": set_args.transition}
+
+        if not body:
+            die(2, "No properties to set. Use --on/--off/--bri/--ct/--color/--transition.")
+
+        # PUT to the right endpoint
+        if target["grouped_light_id"]:
+            ep = f"grouped_light/{target['grouped_light_id']}"
+        else:
+            ep = f"light/{target['id']}"
+
+        request("PUT", ep, body=body, bridge=args.bridge, key=args.key, timeout=args.timeout)
+
+        # Re-read state
+        _, resp = request("GET", ep, bridge=args.bridge, key=args.key, timeout=args.timeout)
+        updated = resp["data"][0] if resp and resp.get("data") else {}
+
+        results.append((target, updated))
+
+    # Output
+    if args.json:
+        json_rows = []
+        for target, updated in results:
+            json_rows.append(trim_resource({"id": target["id"], **updated}, snap))
+        json_out(json_rows, args.quiet)
+    elif not args.quiet:
+        for target, updated in results:
+            name = target["name"]
+            if target["grouped_light_id"]:
+                _, any_on = get_gl_on(updated)
+                state = "on" if any_on else "off"
+                bri = get_light_brightness(updated)
+            else:
+                on_state = get_light_on(updated)
+                state = "on" if on_state else "off"
+                bri = get_light_brightness(updated)
+            line = f"  {name}: {state}"
+            if bri is not None:
+                line += f", {format_bri(bri)}"
+            print(line)
+
+
+def cmd_scene(args):
+    """Activate a scene."""
+    snap = _get_snap(args)
+    name = args.scene
+    room_filter = args.room
+    room_id = None
+
+    if room_filter:
+        # Resolve room name to id
+        room_results = resolve_name(room_filter, snap)
+        room_filter_objs = [r for r in room_results if r["type"] == "room"]
+        if not room_filter_objs:
+            die(3, f'No room named "{room_filter}".')
+        room_id = room_filter_objs[0]["id"]
+
+    scenes = _resolve_scene_name(name, snap, room_filter=room_id)
+
+    if not scenes:
+        # Try without room filter
+        scenes = _resolve_scene_name(name, snap, room_filter=None)
+        if len(scenes) > 1:
+            rooms_list = ", ".join(sorted(set(s["room_name"] for s in scenes)))
+            die(3, f'Scene "{name}" is ambiguous (found in: {rooms_list}). Use --room to specify.')
+        elif not scenes:
+            die(3, f'No scene named "{name}".')
+
+    scene = scenes[0]
+    body = {"recall": {"action": "active"}}
+    request("PUT", f"scene/{scene['id']}", body=body, bridge=args.bridge, key=args.key, timeout=args.timeout)
+
+    if not args.quiet:
+        print(f"  Scene '{scene['name']}' activated in {scene['room_name']}")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_snap(args):
+    """Get a snapshot, sharing cached result within the call."""
+    bridge, key = args.bridge, args.key
+    if not bridge or not key:
+        cfg = load_config(bridge, key)
+        bridge = cfg["bridge"]
+        key = cfg["key"]
+        args.bridge = bridge
+        args.key = key
+    if not bridge:
+        die(4, "No bridge configured. Run 'hue pair --bridge <IP>' first.")
+    if not key:
+        die(4, "No key configured. Run 'hue pair --bridge <IP>' first.")
+    return snapshot(bridge, key, args.timeout)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="hue",
+        description="Control Philips Hue lights from the command line.",
+        epilog=(
+            "Examples:\n"
+            "  hue pair --bridge 192.168.1.100    Pair with the bridge\n"
+            "  hue lights                         List all lights\n"
+            "  hue on desk                        Turn the 'desk' room on\n"
+            "  hue off desk                       Turn it off\n"
+            "  hue set desk --bri 50 --ct 4000    Dim to 50%, warm white\n"
+            "  hue set desk --color coral         Set colour\n"
+            "  hue scene bright --room office     Activate scene\n"
+            "  hue status --json                  Everything as JSON\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Global flags
+    parser.add_argument("--bridge", help="Bridge IP address")
+    parser.add_argument("--key", help="Application key")
+    parser.add_argument("--timeout", type=int, default=5, help="HTTP timeout in seconds (default: 5)")
+    parser.add_argument("--json", action="store_true", help="Output JSON")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress normal output")
+    parser.add_argument("--version", action="version", version="hue 0.1")
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # pair
+    p_pair = sub.add_parser("pair", help="Pair with a Hue bridge")
+    p_pair.add_argument("--bridge", dest="pair_bridge", help="Bridge IP (optional: auto-discover)")
+
+    # lights
+    sub.add_parser("lights", help="List lights")
+
+    # rooms
+    sub.add_parser("rooms", help="List rooms")
+
+    # scenes
+    p_scenes = sub.add_parser("scenes", help="List scenes")
+    p_scenes.add_argument("room", nargs="?", default=None, help="Filter by room name")
+
+    # status
+    p_status = sub.add_parser("status", help="Show status of targets or everything")
+    p_status.add_argument("target", nargs="*", default=None, help="Target names (omit for all)")
+
+    # on
+    p_on = sub.add_parser("on", help="Turn target(s) on")
+    p_on.add_argument("target", nargs="+", help="Target names")
+
+    # off
+    p_off = sub.add_parser("off", help="Turn target(s) off")
+    p_off.add_argument("target", nargs="+", help="Target names")
+
+    # toggle
+    p_toggle = sub.add_parser("toggle", help="Toggle target(s)")
+    p_toggle.add_argument("target", nargs="+", help="Target names")
+
+    # set
+    p_set = sub.add_parser("set", help="Set properties on target(s)")
+    p_set.add_argument("target", nargs="+", help="Target names")
+    p_set.add_argument("--bri", dest="brightness", type=int, help="Brightness 1-100")
+    p_set.add_argument("--ct", type=int, dest="color_temp", help="Color temperature in Kelvin (2000-6500)")
+    p_set.add_argument("--color", help="CSS color name or #rrggbb")
+    p_set.add_argument("--on", dest="set_on", action="store_true", default=None, help="Turn on")
+    p_set.add_argument("--off", dest="set_off", action="store_true", default=None, help="Turn off")
+    p_set.add_argument("--transition", type=int, help="Transition duration in ms")
+
+    # scene
+    p_scene = sub.add_parser("scene", help="Activate a scene")
+    p_scene.add_argument("scene", help="Scene name")
+    p_scene.add_argument("--room", help="Room name (required if ambiguous)")
+
+    args = parser.parse_args()
+
+    # Propagate global args to subcommand args
+    args.bridge = getattr(args, "pair_bridge", None) or args.bridge
+    args.key = args.key
+    args.timeout = args.timeout
+    args.json = args.json
+    args.quiet = args.quiet
+
+    # Route
+    cmd_map = {
+        "pair": cmd_pair,
+        "lights": cmd_lights,
+        "rooms": cmd_rooms,
+        "scenes": cmd_scenes,
+        "status": cmd_status,
+        "on": cmd_on,
+        "off": cmd_off,
+        "toggle": cmd_toggle,
+        "set": cmd_set,
+        "scene": cmd_scene,
+    }
+
+    cmd_map[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
